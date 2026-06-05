@@ -21,13 +21,15 @@
 
   // ---------- marked 配置 ----------
   // 自定义 renderer：为标题生成 id（用于 TOC 锚点）
+  // 注意：marked v12 使用 heading(text, level, raw) 旧位置参数签名；
+  // v13+ 才换成对象参数 ({tokens, depth})。这里按 v12 写。
   const renderer = new marked.Renderer();
   const usedSlugs = new Map();
   function slugify(text) {
-    const base = text
-      .toString()
+    const base = String(text)
       .trim()
       .toLowerCase()
+      .replace(/<[^>]+>/g, '')          // 去掉 inline HTML（如 <code>）
       .replace(/[\s]+/g, '-')
       .replace(/[^\p{L}\p{N}\-_]/gu, '')
       .replace(/^-+|-+$/g, '') || 'section';
@@ -35,42 +37,120 @@
     usedSlugs.set(base, count + 1);
     return count === 0 ? base : `${base}-${count}`;
   }
-  renderer.heading = function ({ tokens, depth }) {
-    const text = this.parser.parseInline(tokens);
-    const raw = tokens.map(t => t.raw || t.text || '').join('');
-    const id = slugify(raw);
-    return `<h${depth} id="${id}">${text}</h${depth}>\n`;
+  renderer.heading = function (text, level, raw) {
+    const id = slugify(raw || text);
+    return `<h${level} id="${id}">${text}</h${level}>\n`;
   };
 
   marked.setOptions({
     renderer,
     gfm: true,
     breaks: false,
-    highlight: function (code, lang) {
-      try {
-        if (lang && hljs.getLanguage(lang)) {
-          return hljs.highlight(code, { language: lang }).value;
-        }
-        return hljs.highlightAuto(code).value;
-      } catch (_) {
-        return code;
-      }
-    },
   });
 
   // ---------- 渲染 ----------
   function render() {
     usedSlugs.clear();
     const src = editor.value;
-    const html = marked.parse(src);
+    let html;
+    try {
+      html = marked.parse(src);
+    } catch (err) {
+      console.error('[md-reader] marked.parse failed:', err);
+      html = `<pre style="color:#c00;white-space:pre-wrap;">渲染出错：${escapeHtml(String(err && err.message || err))}</pre>`;
+    }
     preview.innerHTML = html;
-    // 兜底再走一遍 highlight（兼容 marked v12 highlight 选项变动）
+    // 代码块语法高亮（marked v12 推荐用 marked-highlight 扩展，
+    // 这里直接渲染后用 highlight.js 处理一次更稳）
     preview.querySelectorAll('pre code').forEach((block) => {
-      if (!block.classList.contains('hljs')) {
-        try { hljs.highlightElement(block); } catch (_) {}
-      }
+      try { hljs.highlightElement(block); } catch (_) {}
     });
+    // 自动把 x20 / go / b/ / cl/ 等 Google 内部裸链接转成可点击链接
+    linkifyInternalRefs(preview);
     buildToc();
+  }
+
+  // ---------- 内部裸链自动识别 ----------
+  // 把文本节点里的 x20 / go/xxx / b/12345 / cl/12345 / yaqs/xxx 等转成 <a>
+  const INTERNAL_LINK_PATTERNS = [
+    // 完整 URL 形式：http(s)://x20.corp.google.com/... 或 http://x20/...
+    { re: /\bhttps?:\/\/x20(?:\.corp\.google\.com)?\/[^\s<>"')\]]+/g, build: (m) => m },
+    // 裸路径 /x20/... （以 /x20 开头）
+    { re: /(^|[\s(\[>])\/x20\/[^\s<>"')\]]+/g, build: (m, lead) => {
+      const path = m.slice(lead.length); // 形如 /x20/teams/...
+      // x20 真实 URL 不带 /x20 前缀
+      return lead + makeLink('https://x20.corp.google.com' + path.slice(4), path);
+    }, withLead: true },
+    // x20/... 裸前缀（前面是空白/标点/行首）
+    { re: /(^|[\s(\[>])x20\/[^\s<>"')\]]+/g, build: (m, lead) => {
+      const path = m.slice(lead.length); // x20/...
+      return lead + makeLink('https://x20.corp.google.com/' + path.slice(4), path);
+    }, withLead: true },
+    // go/xxx
+    { re: /(^|[\s(\[>])go\/[A-Za-z0-9_\-./]+/g, build: (m, lead) => {
+      const link = m.slice(lead.length);
+      return lead + makeLink('https://' + link, link);
+    }, withLead: true },
+    // b/12345 (buganizer)
+    { re: /(^|[\s(\[>])b\/\d+/g, build: (m, lead) => {
+      const link = m.slice(lead.length);
+      return lead + makeLink('https://b.corp.google.com/' + link.slice(2), link);
+    }, withLead: true },
+    // cl/12345 (changelist)
+    { re: /(^|[\s(\[>])cl\/\d+/g, build: (m, lead) => {
+      const link = m.slice(lead.length);
+      return lead + makeLink('https://critique.corp.google.com/' + link, link);
+    }, withLead: true },
+    // yaqs/12345
+    { re: /(^|[\s(\[>])yaqs\/\d+/g, build: (m, lead) => {
+      const link = m.slice(lead.length);
+      return lead + makeLink('https://yaqs.corp.google.com/eng/q/' + link.slice(5), link);
+    }, withLead: true },
+  ];
+
+  function makeLink(href, text) {
+    return `<a href="${href}" target="_blank" rel="noopener noreferrer">${escapeHtml(text)}</a>`;
+  }
+
+  function linkifyInternalRefs(root) {
+    // 跳过 <a> / <code> / <pre> 内的文本
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        let p = node.parentNode;
+        while (p && p !== root) {
+          const tag = p.nodeName;
+          if (tag === 'A' || tag === 'CODE' || tag === 'PRE') return NodeFilter.FILTER_REJECT;
+          p = p.parentNode;
+        }
+        return node.nodeValue && node.nodeValue.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      },
+    });
+    const targets = [];
+    let n;
+    while ((n = walker.nextNode())) targets.push(n);
+
+    targets.forEach((textNode) => {
+      let text = textNode.nodeValue;
+      // 检测是否有任何匹配
+      const hasMatch = INTERNAL_LINK_PATTERNS.some((p) => {
+        p.re.lastIndex = 0;
+        return p.re.test(text);
+      });
+      if (!hasMatch) return;
+
+      let html = escapeHtml(text);
+      INTERNAL_LINK_PATTERNS.forEach((p) => {
+        p.re.lastIndex = 0;
+        if (p.withLead) {
+          html = html.replace(p.re, (m, lead) => p.build(m, lead));
+        } else {
+          html = html.replace(p.re, (m) => p.build(m));
+        }
+      });
+      const span = document.createElement('span');
+      span.innerHTML = html;
+      textNode.parentNode.replaceChild(span, textNode);
+    });
   }
 
   // 防抖
@@ -304,6 +384,18 @@ print([fib(i) for i in range(10)])
 ## 链接 & 图片
 
 访问 [GitHub](https://github.com/FannYYW/md-reader) 查看源码。
+
+## 🏢 Google 内部链接（自动识别）
+
+下面这些写法 **不用 Markdown 语法** 也会自动变成可点击链接：
+
+- x20 路径：/x20/teams/example/file.txt
+- x20 短前缀：x20/teams/example/file.txt
+- 完整 URL：https://x20.corp.google.com/teams/example
+- Go 短链：go/cloudcode
+- Buganizer：b/123456
+- Changelist：cl/789012
+- YAQS：yaqs/345678
 
 ---
 
